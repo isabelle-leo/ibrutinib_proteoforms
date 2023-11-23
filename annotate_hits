@@ -1,0 +1,441 @@
+#BiocManager::install("Rcpi")
+library(Rcpi)
+library(openxlsx)
+library(purrr)
+library(ComplexHeatmap)
+library(viridis)
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(tidyr)
+options(stringsAsFactors = FALSE)
+
+setwd("/your/path/")
+
+hits_all <- readRDS("~/path/nparc_df_all_full_null.RDS")
+hits_18 <- readRDS("~/path/nparc_df_rchacv.RDS")
+hits_19 <- readRDS("~/path/nparc_df_sw13.RDS")
+
+modelMetrics_proteoforms <-readRDS("~/path/model_metrics_proteoforms_all.RDS")
+modelMetrics_sw13 <-readRDS("~/path/model_metrics_proteoforms_sw13.RDS")
+modelMetrics_rchacv <-readRDS("~/path/model_metrics_proteoforms_rchacv.RDS")
+
+hits_all$aumc_dmso <- modelMetrics_proteoforms$metrics[modelMetrics_proteoforms$metrics$group == "DMSO",]$aumc
+hits_all$aumc_ibrutinib <- modelMetrics_proteoforms$metrics[modelMetrics_proteoforms$metrics$group == "IBRUTINIB",]$aumc
+hits_all$aumc_delta <- hits_all$aumc_dmso - hits_all$aumc_ibrutinib
+
+
+hits_18$aumc_dmso <- modelMetrics_rchacv$metrics[modelMetrics_rchacv$metrics$group == "DMSO",]$aumc
+hits_18$aumc_ibrutinib <- modelMetrics_rchacv$metrics[modelMetrics_rchacv$metrics$group == "IBRUTINIB",]$aumc
+hits_18$aumc_delta <- hits_18$aumc_dmso - hits_18$aumc_ibrutinib
+
+hits_19$aumc_dmso <- modelMetrics_sw13$metrics[modelMetrics_sw13$metrics$group == "DMSO",]$aumc
+hits_19$aumc_ibrutinib <- modelMetrics_sw13$metrics[modelMetrics_sw13$metrics$group == "IBRUTINIB",]$aumc
+hits_19$aumc_delta <- hits_19$aumc_dmso - hits_19$aumc_ibrutinib
+
+hits_all$type <- "all"
+hits_18$type <- "RCH-ACV"
+hits_19$type <- "SW13"
+hits_everything <- rbind(hits_all, hits_18, hits_19)
+
+#read in annotation
+library(biomaRt)
+mart <- useEnsembl(dataset = "hsapiens_gene_ensembl", biomart='ensembl')
+uniprot_ids <- getBM(attributes = c("hgnc_symbol",#"pdb",
+                                    #"uniprot_gn_symbol",
+                                    "uniprotswissprot"
+),
+values = gsub("_[0-9]", "", hits_everything$id),
+mart = mart)
+
+#filter which did not get a match
+uniprot_ids <- uniprot_ids[uniprot_ids$uniprotswissprot != "",]
+#get fasta sequences for each hit
+library(curl)
+
+get_FASTA <- function(uniprot_iois, just_first = TRUE){
+  uniprot_iois$fasta <- 0
+  for (i in 1:length(uniprot_ids$uniprotswissprot)) {
+    uniprot_ioi <- uniprot_ids$uniprotswissprot[i]
+
+  #add the file type
+  FASTA_path <- paste0(tempfile(), ".fasta")
+  FASTA_file <- curl_fetch_disk(url = paste0('https://rest.uniprot.org/uniprotkb/', uniprot_ioi, '.fasta'),
+                                handle = new_handle(),
+                                path = FASTA_path)
+  
+  AASeq <- readFASTA(file = FASTA_file[["content"]])
+  AASeq <- flatten(AASeq)
+  
+  uniprot_iois$fasta[i] <- AASeq
+  
+  unlink(FASTA_file)
+  
+  # while(request_num <= uniprot_ids_options & alphafold_file[["status_code"]] == 404){
+  #   request_num <-  request_num +1
+  #   uniprot_ioi <- uniprot_ids[uniprot_ids$hgnc_symbol == ioi,]$uniprot_gn_id[request_num]
+  #   alphafold_file <- curl_fetch_disk(url = paste0("https://alphafold.ebi.ac.uk/files/AF-",uniprot_ioi,"-F1-model_v4.pdb"),
+  #                                     handle = new_handle(),
+  #                                     path = alphafold_path)
+  # }
+  }
+  
+  # if(just_first == TRUE){
+  #   
+  #   uniprot_iois <- unique(uniprot_iois)
+  #   
+  # }
+  
+  
+  return(uniprot_iois)
+}
+
+fasta <- get_FASTA(uniprot_ids)
+
+# fasta <- list()
+# for (i in 1:length(uniprot_ids$uniprot_gn_id)) {
+# fasta[uniprot_ids$uniprot_gn_id[i]] <- getSeqFromUniProt(id = uniprot_ids$uniprot_gn_id)
+# }
+# 
+# #use purrr to make it a dataframe
+# flat <- flatten(fasta)
+# flat.df <- t(as.data.frame(flat))
+
+#were any of them lost?
+unique(fasta$uniprotswissprot == uniprot_ids$uniprotswissprot)
+
+
+hits_everything$hgnc_symbol <- gsub("_[0-9]", "", hits_everything$id)
+hits_everything <- left_join(hits_everything, unique(fasta), by = "hgnc_symbol")
+#make logical tests, do we have the GCL/G*L seqience?
+hits_everything$GCL <- grepl("GCL", hits_everything$fasta)
+hits_everything$GSL <- grepl("GSL", hits_everything$fasta)
+hits_everything$GTL <- grepl("GTL", hits_everything$fasta)
+hits_everything$GYL <- grepl("GYL", hits_everything$fasta)
+hits_everything$Has.G.L <- hits_everything$GCL == TRUE | hits_everything$GSL == TRUE | hits_everything$GTL == TRUE | hits_everything$GYL == TRUE
+hits_everything$Has.Other.G.L <- grepl("G*L", hits_everything$fasta)
+
+#annotate stability or destability
+
+hits_everything$Shift.Direction <- hits_everything$aumc_delta > 0
+hits_everything$Shift.Direction <- gsub("TRUE","Destabilized",hits_everything$Shift.Direction)
+hits_everything$Shift.Direction <- gsub("FALSE","Stabilized",hits_everything$Shift.Direction)
+
+#make a heatmap
+#For now, no G.L or pathway column, still completing covalent binding column, alter later if needed!
+hits_everything$G.L.sequence <- NULL
+hits_everything$Pathway <- NULL
+hits_everything$Confirmed.Covalent.Binder <- NULL
+
+#sort by shift direction in RCHACV
+hits_everything <- hits_everything[order(as.factor(hits_everything$"Shift.Direction")),]
+
+#save out - hits_everything
+saveRDS(hits_everything, "output/hits_everything.RDS")
+hits_everything <- readRDS("output/hits_everything.RDS")
+annotation <- hits_everything[,c("id","hgnc_symbol", "fasta","GCL","GSL","GTL",
+                                 "GYL", "Has.G.L","aumc_dmso", "aumc_ibrutinib",
+                                 "aumc_delta", "Shift.Direction", "pVal", "pAdj",
+                                 "fStat", "type")] %>%
+   pivot_wider(names_from = type, values_from = c(#id, hgnc_symbol, 
+                                                  aumc_dmso, aumc_ibrutinib, aumc_delta, 
+                                                  Shift.Direction, pVal, pAdj, fStat#,
+  #                                               Has.G.L, GCL, GSL, GTL, GYL
+  ),
+  values_fn = list
+  )
+
+ annotation_full <- unnest(annotation) #%>%
+#   mutate(across(starts_with("aumc"), ~ unlist(.))) %>%
+#   mutate(across(starts_with("Shift"), ~ unlist(.))) %>%
+#   mutate(across(starts_with("p"), ~ unlist(.))) %>%
+#   mutate(across(starts_with("fStat"), ~ unlist(.))) %>%
+#   drop_na()
+ annotation_full <-  annotation_full[complete.cases( annotation_full),]
+ annotation <- annotation_full[annotation_full$pVal_all < .0001 ,]
+
+ annotation <- as.data.frame(annotation)
+col_anno <- HeatmapAnnotation(df = annotation[,#colnames(annotation) != "id" & 
+                                                colnames(annotation) != "fasta" &
+                                                colnames(annotation) != "hgnc_symbol" &
+                                                colnames(annotation) != "aumc_dmso_all"  &
+                                                colnames(annotation) != "aumc_delta_all"  &
+                                                colnames(annotation) != "aumc_ibrutinib_all"  &
+                                                colnames(annotation) != "aumc_dmso_RCH-ACV"  &
+                                                colnames(annotation) != "aumc_delta_RCH-ACV"  &
+                                                colnames(annotation) != "aumc_ibrutinib_RCH-ACV"  &
+                                                colnames(annotation) != "aumc_dmso_SW13"  &
+                                                colnames(annotation) != "aumc_delta_SW13"  &
+                                                colnames(annotation) != "aumc_ibrutinib_SW13"  &
+                                                colnames(annotation) != "pAdj_all"  &
+                                                colnames(annotation) != "pVal_all"  &
+                                                colnames(annotation) != "fStat_all"  &
+                                                colnames(annotation) != "pAdj_RCH-ACV"  &
+                                                colnames(annotation) != "pVal_RCH-ACV"  &
+                                                colnames(annotation) != "fStat_RCH-ACV"  &
+                                                colnames(annotation) != "pAdj_SW13"  &
+                                                colnames(annotation) != "pVal_SW13"  &
+                                                colnames(annotation) != "fStat_SW13"  &
+                                                colnames(annotation) != "id" &
+                                                colnames(annotation) != "Shift.Direction_RCH-ACV"&
+                                                colnames(annotation) != "Shift.Direction_SW13"
+                                                
+                                                
+                                                ],
+                              col = list("GCL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+                                         "GSL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+                                         "GTL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+                                         "GYL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+                                         "Has.G.L" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+                                         "Shift.Direction_all" = c("Destabilized" = "#5FB0B7", "Stabilized" = "#1B3B6F"),
+                                         "Shift.Direction_RCH-ACV" = c("Destabilized" = "#5FB0B7", "Stabilized" = "#1B3B6F"),
+                                         "Shift.Direction_SW13" = c("Destabilized" = "#5FB0B7", "Stabilized" = "#1B3B6F")),
+                              show_legend = F)
+
+plot.mat <- as.matrix(t(annotation[,colnames(annotation) %in% c("aumc_delta_SW13", "aumc_delta_RCH-ACV")]))
+colnames(plot.mat) <- annotation$id
+
+library(circlize)
+col_fun = colorRamp2(c(-2, 0, 2), c("#1B3B6F", "white", "#5FB0B7"))
+
+pdf(file = "output/overview-nparc.pdf", width = 12, height = 2.6)
+draw(Heatmap(plot.mat,cluster_rows = F, cluster_columns = F,show_row_dend = F,show_column_dend = F,row_names_side = "right",column_names_side = "top",
+             #rect_gp = gpar(col = "#e3e6e8", lwd = 0.2),
+             row_title = "", column_title_gp = gpar(fontsize = 11),
+             column_names_gp = gpar(fontsize = 9),
+             show_heatmap_legend = F,
+             top_annotation = col_anno,
+             col = col_fun
+            ),
+     annotation_legend_side = "bottom")
+dev.off()
+#some manual changes to xis labels, remove excess text
+#create source for legend
+col_anno <- HeatmapAnnotation(df = as.data.frame(annotation[,#colnames(annotation) != "id" & 
+                                              colnames(annotation) != "fasta" &
+                                                colnames(annotation) != "hgnc_symbol" &
+                                                colnames(annotation) != "aumc_dmso_all"  &
+                                                colnames(annotation) != "aumc_delta_all"  &
+                                                colnames(annotation) != "aumc_ibrutinib_all"  &
+                                                colnames(annotation) != "aumc_dmso_RCH-ACV"  &
+                                                colnames(annotation) != "aumc_delta_RCH-ACV"  &
+                                                colnames(annotation) != "aumc_ibrutinib_RCH-ACV"  &
+                                                colnames(annotation) != "aumc_dmso_SW13"  &
+                                                colnames(annotation) != "aumc_delta_SW13"  &
+                                                colnames(annotation) != "aumc_ibrutinib_SW13"  &
+                                                colnames(annotation) != "pAdj_all"  &
+                                                colnames(annotation) != "pVal_all"  &
+                                                colnames(annotation) != "fStat_all"  &
+                                                colnames(annotation) != "pAdj_RCH-ACV"  &
+                                                colnames(annotation) != "pVal_RCH-ACV"  &
+                                                colnames(annotation) != "fStat_RCH-ACV"  &
+                                                colnames(annotation) != "pAdj_SW13"  &
+                                                colnames(annotation) != "pVal_SW13"  &
+                                                colnames(annotation) != "fStat_SW13"  &
+                                                colnames(annotation) != "id" 
+                                              
+                                              
+]
+),
+col = list("GCL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "GSL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "GTL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "GYL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "Has.G.L" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "Shift.Direction_all" = c("Destabilized" = "#5FB0B7", "Stabilized" = "#1B3B6F"),
+           "Shift.Direction_RCH-ACV" = c("Destabilized" = "#5FB0B7", "Stabilized" = "#1B3B6F"),
+           "Shift.Direction_SW13" = c("Destabilized" = "#5FB0B7", "Stabilized" = "#1B3B6F")),
+show_legend = T)
+pdf(file = "overview-legend1.pdf", width = 6.79, height = 2.74)
+draw(Heatmap(plot.mat,cluster_rows = F, cluster_columns = F,show_row_dend = F,show_column_dend = F,row_names_side = "right",column_names_side = "top",
+             #rect_gp = gpar(col = "#e3e6e8", lwd = 0.2),
+             row_title = "", column_title_gp = gpar(fontsize = 11),
+             column_names_gp = gpar(fontsize = 9),
+             show_heatmap_legend = T,
+             top_annotation = col_anno,
+             col = col_fun),
+     annotation_legend_side = "bottom")
+dev.off()
+
+######################################################################################################################
+#Supp FIG 1
+annotation_full <- annotation_full[complete.cases(annotation_full),]
+annotation_full$Significant <- annotation_full$pVal_all < .05 |
+                  annotation_full$`pVal_RCH-ACV` < .05 |
+                  annotation_full$`pVal_SW13` < .05
+annotation_full$Significant_FDR_adjusted <- annotation_full$pAdj_all < .05 |
+  annotation_full$`pAdj_RCH-ACV` < .05 |
+  annotation_full$`pAdj_SW13` < .05
+col_anno <- HeatmapAnnotation(df = as.data.frame(annotation_full[,#colnames(annotation) != "id" & 
+                                              colnames(annotation_full) != "fasta" &
+                                                colnames(annotation_full) != "hgnc_symbol" &
+                                                colnames(annotation_full) != "aumc_dmso_all"  &
+                                                colnames(annotation_full) != "aumc_delta_all"  &
+                                                colnames(annotation_full) != "aumc_ibrutinib_all"  &
+                                                colnames(annotation_full) != "aumc_dmso_RCH-ACV"  &
+                                                colnames(annotation_full) != "aumc_delta_RCH-ACV"  &
+                                                colnames(annotation_full) != "aumc_ibrutinib_RCH-ACV"  &
+                                                colnames(annotation_full) != "aumc_dmso_SW13"  &
+                                                colnames(annotation_full) != "aumc_delta_SW13"  &
+                                                colnames(annotation_full) != "aumc_ibrutinib_SW13"  &
+                                                colnames(annotation_full) != "pAdj_all"  &
+                                                colnames(annotation_full) != "pVal_all"  &
+                                                colnames(annotation_full) != "fStat_all"  &
+                                                colnames(annotation_full) != "pAdj_RCH-ACV"  &
+                                                colnames(annotation_full) != "pVal_RCH-ACV"  &
+                                                colnames(annotation_full) != "fStat_RCH-ACV"  &
+                                                colnames(annotation_full) != "pAdj_SW13"  &
+                                                colnames(annotation_full) != "pVal_SW13"  &
+                                                colnames(annotation_full) != "fStat_SW13"  &
+                                                colnames(annotation_full) != "id" &
+                                                colnames(annotation_full) != "Shift.Direction_RCH-ACV"&
+                                                colnames(annotation_full) != "Shift.Direction_SW13"&
+                                                colnames(annotation_full) != "Shift.Direction_all"
+                                              
+                                              
+]
+),
+col = list("GCL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "GSL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "GTL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "GYL" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "Has.G.L" = c("TRUE" = "#E0CA3C","FALSE" = "#F5EFED"),
+           "Significant" = c("TRUE" = "#973456","FALSE" = "#F5EFED"),
+           "Significant_FDR_adjusted" = c("TRUE" = "#973456","FALSE" = "#F5EFED")#,
+           #"Shift.Direction_all" = c("Stabilized" = "#5FB0B7", "Destabilized" = "#1B3B6F"),
+           #"Shift.Direction_RCH-ACV" = c("Stabilized" = "#5FB0B7", "Destabilized" = "#1B3B6F"),
+           #"Shift.Direction_SW13" = c("Stabilized" = "#5FB0B7", "Destabilized" = "#1B3B6F")
+          ),
+show_legend = F)
+
+plot.mat <- as.matrix(t(annotation_full[complete.cases(annotation_full),colnames(annotation_full) %in% c("aumc_delta_SW13", "aumc_delta_RCH-ACV", "aumc_delta_all")]))
+colnames(plot.mat) <- annotation_full[complete.cases(annotation_full),]$id
+
+pdf(file = "overview-nparc-everything.pdf", width = 10, height = 3)
+draw(Heatmap(plot.mat,cluster_rows = F, cluster_columns = T,show_row_dend = F,show_column_dend = F,row_names_side = "right",column_names_side = "top",
+             #rect_gp = gpar(col = "#e3e6e8", lwd = 0.2),
+             row_title = "", column_title_gp = gpar(fontsize = 0),
+             column_names_gp = gpar(fontsize = 0),
+             show_heatmap_legend = F,
+             top_annotation = col_anno,
+             col = col_fun),
+     annotation_legend_side = "bottom")
+dev.off()
+
+######################################################################################################################
+#Make table of hits and findd out how many
+
+length(unique(hits_everything[hits_everything$pVal < .05 & complete.cases(hits_everything$id),]$id))
+length(unique(hits_everything[hits_everything$pVal < .05 & complete.cases(hits_everything$id),]$hgnc_symbol))
+
+length(unique(hits_everything[hits_everything$pAdj < .05 & complete.cases(hits_everything$id),]$id))
+length(unique(hits_everything[hits_everything$pAdj < .05 & complete.cases(hits_everything$id),]$hgnc_symbol))
+
+openxlsx::write.xlsx(hits_everything[hits_everything$pVal < .05 & complete.cases(hits_everything$id),], file = "output/Supplementary_table_1_hits.xlsx")
+#---------------
+annotation <- annotation_full[annotation_full$pVal_all < .05 |
+                                annotation_full$`pVal_RCH-ACV` < .05 |
+                                annotation_full$`pVal_SW13` < .05,]
+
+
+#fasta.all <- readFASTA(file = "data/uniprot-(taxonomy_9606)+AND+reviewed_yes.fasta")
+#proportions test to show if the enrichment is different in shifted versus other proteins
+hasgl.prop <- prop.test(x = c(sum(annotation$Has.G.L), sum(annotation_full$Has.G.L)), 
+          n = c(length(annotation$Has.G.L), length(annotation_full$Has.G.L)), 
+          p = NULL, alternative = "greater",
+          correct = TRUE)
+
+#proportions test to show if the canonical GCL sequence enrichment is different in shifted versus other proteins
+gcl.prop <-prop.test(x = c(sum(annotation$GCL), sum(annotation_full$GCL)), 
+          n = c(length(annotation$GCL), length(annotation_full$GCL)), 
+          p = NULL, alternative = "greater",
+          correct = TRUE)
+
+#proportions test to show if the GSL sequence enrichment is different in shifted versus other proteins
+gsl.prop <- prop.test(x = c(sum(annotation$GSL), sum(annotation_full$GSL)), 
+          n = c(length(annotation$GSL), length(annotation_full$GSL)), 
+          p = NULL, alternative = "greater",
+          correct = TRUE)
+
+#proportions test to show if the GTL sequence enrichment is different in shifted versus other proteins
+gtl.prop <-prop.test(x = c(sum(annotation$GTL), sum(annotation_full$GTL)), 
+          n = c(length(annotation$GTL), length(annotation_full$GTL)), 
+          p = NULL, alternative = "greater",
+          correct = TRUE)
+#proportions test to show if the GYL sequence enrichment is different in shifted versus other proteins
+gyl.prop <-prop.test(x = c(sum(annotation$GYL), sum(annotation_full$GYL)), 
+          n = c(length(annotation$GYL), length(annotation_full$GYL)), 
+          p = NULL, alternative = "greater",
+          correct = TRUE)
+
+
+data.lollipop <- data.frame("G*L" = hasgl.prop[["p.value"]],"GSL" = gsl.prop[["p.value"]],
+                            "GTL" = gtl.prop[["p.value"]],"GYL" = gyl.prop[["p.value"]],
+                            "GCL" = gcl.prop[["p.value"]])
+
+data.lollipop <- as.data.frame(t(data.lollipop))
+data.lollipop$Sequence <- rownames(data.lollipop)
+data.lollipop$neglog10p <- -1 * log10(data.lollipop$V1)
+
+pdf(file = "output/Lolliplot.GL.pdf", width = 3.9, height = 3.75)
+ggplot(data.lollipop, aes(x = Sequence, y = neglog10p)) +
+  geom_segment(aes(x = Sequence, xend = Sequence, y = 0, yend = neglog10p), size = 4, color = "#127475", alpha = 1) +
+  geom_point(size = 8,fill = "#0E9594", color = "#0E9594", alpha = 1, stroke = 0) + 
+  geom_point(size = 19,fill = "#0E9594", color = "#0E9594", alpha = .4, stroke = 0) + 
+  geom_hline(yintercept  = 1.30103, color = "#0E9594", linetype = "dashed") +
+  ylim(-0.1,4.2) +
+  labs(y = expression(paste("- ", log[10], "( p )")))+
+  theme_pubr()
+dev.off()
+
+################################################################################
+#search for regions or domains enriched
+
+mart <- useEnsembl(dataset = "hsapiens_gene_ensembl", biomart='ensembl')  
+View(listAttributes(mart))
+domains <- getBM(attributes = c("hgnc_symbol",#"pdb",
+                                    #"uniprot_gn_symbol",
+                                    "interpro_short_description"
+                                #"biogrid"
+),
+values = gsub("_[0-9]", "", unique(annotation$hgnc_symbol)),
+mart = mart)
+
+biogrid <- getBM(attributes = c("hgnc_symbol",#"pdb",
+                                #"uniprot_gn_symbol",
+                                #"interpro"
+                                "biogrid"
+),
+values = gsub("_[0-9]", "", unique(hits_everything$hgnc_symbol)),
+mart = mart)
+
+library(WebGestaltR)
+enrichResult <- WebGestaltR(enrichMethod="NTA", organism="hsapiens",
+                            enrichDatabase="network_PPI_BIOGRID", interestGene = unique(annotation$hgnc_symbol),
+                            interestGeneType="genesymbol", #referenceGene = unique(hits_everything$hgnc_symbol),
+                            referenceGeneType="genesymbol", isOutput=TRUE,
+                            sigMethod="top", topThr=100,
+                            outputDirectory=getwd(), highlightSeedNum=10,
+                            networkConstructionMethod="Network_Retrieval_Prioritization")
+
+enrichResult_corum_plausible <- WebGestaltR(enrichMethod="ORA", organism="hsapiens",
+                            enrichDatabase="network_CORUM", interestGene = unique(hits_everything[hits_everything$pVal < 0.05,]$hgnc_symbol),
+                            interestGeneType="genesymbol", referenceGene = unique(hits_everything$hgnc_symbol),
+                            referenceGeneType="genesymbol", isOutput=TRUE,
+                            sigMethod="fdr", fdrMethod = "BH", fdrThr = 0.1,
+                            minNum = 3,
+                            outputDirectory=getwd())
+enrichResult_corum_likely <- WebGestaltR(enrichMethod="ORA", organism="hsapiens",
+                                            enrichDatabase="network_CORUM", interestGene = unique(hits_everything[hits_everything$pAdj < 0.05,]$hgnc_symbol),
+                                            interestGeneType="genesymbol", referenceGene = unique(hits_everything$hgnc_symbol),
+                                            referenceGeneType="genesymbol", isOutput=TRUE,
+                                            sigMethod="fdr", fdrMethod = "BH", fdrThr = 0.05,
+                                            minNum = 3,
+                                            outputDirectory=getwd())
+
+
+openxlsx::write.xlsx(file = "output/annotation.txt", annotation )
+################################################################################
+
+
+
