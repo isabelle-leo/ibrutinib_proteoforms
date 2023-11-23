@@ -1,0 +1,75 @@
+###How many proteoforms, not found in kinobeads, are NS for another proteoform?
+'%!in%' <- function(x,y)!('%in%' (x,y))
+
+targets_listed <- readRDS("output/venn_plot_targets_listed.RDS")
+hits_everything <- readRDS("output/hits_everything.RDS")
+
+#What is novel?
+best_hits_names <- unique(gsub("_[0-9]","",hits_everything[hits_everything$pAdj < 0.05,]$id))
+no_way_names <- unique(gsub("_[0-9]","",hits_everything[hits_everything$pVal > 0.05,]$id))
+sum(best_hits_names %in% no_way_names)
+
+
+# results_not_in_KINOBEADS <- hits_everything[hits_everything$hgnc_symbol %!in% targets_listed[["Kinobeads hits"]] &
+#                                               hits_everything$hgnc_symbol %in% c(targets_listed[["RCH-ACV TPP hits"]], targets_listed[["SW13 TPP hits"]]),]
+results_not_in_KINOBEADS <- hits_everything[hits_everything$hgnc_symbol %!in% targets_listed[["Kinobeads hits"]] & 
+                                              hits_everything$hgnc_symbol %in% hits_everything[hits_everything$pAdj < 0.05,]$hgnc_symbol,]
+results_not_in_KINOBEADS$proteoform_clustered <- !grepl("_0", results_not_in_KINOBEADS$id)
+
+#final table
+results_not_in_KINOBEADS_filt <- results_not_in_KINOBEADS[results_not_in_KINOBEADS$proteoform_clustered == TRUE &
+                                                            results_not_in_KINOBEADS$pVal > 0.05,]
+
+
+results_not_in_kinobeads_names <- unique(results_not_in_KINOBEADS$hgnc_symbol)
+results_not_in_kinobeads_not_significant_names <- unique(results_not_in_KINOBEADS_filt$hgnc_symbol)
+results_not_in_kinobeads_not_clustered_names <-unique(results_not_in_KINOBEADS[results_not_in_KINOBEADS$proteoform_clustered == FALSE,]$hgnc_symbol)
+#what are the new unique ones that are in all proteoforms?
+results_not_in_kinobeads_names[results_not_in_kinobeads_names %!in% results_not_in_kinobeads_not_significant_names &
+                                 results_not_in_kinobeads_names %!in% results_not_in_kinobeads_not_clustered_names   ]
+
+#repeat for results in kinobeads
+results_in_KINOBEADS <- hits_everything[hits_everything$hgnc_symbol %in% targets_listed[["Kinobeads hits"]] & 
+                                              hits_everything$hgnc_symbol %in% hits_everything[hits_everything$pAdj < 0.05,]$hgnc_symbol,]
+results_in_KINOBEADS$proteoform_clustered <- !grepl("_0", results_in_KINOBEADS$id)
+
+#final table
+results_in_KINOBEADS_filt <- results_in_KINOBEADS[results_in_KINOBEADS$proteoform_clustered == TRUE &
+                                                            results_in_KINOBEADS$pVal > 0.05,]
+
+
+unique(results_in_KINOBEADS$hgnc_symbol)
+unique(results_in_KINOBEADS_filt$hgnc_symbol)
+
+#how many not clustered to proteoforms?
+results_not_in_KINOBEADS_filt <- results_not_in_KINOBEADS[results_not_in_KINOBEADS$proteoform_clustered == TRUE &
+                                                            results_not_in_KINOBEADS$pVal > 0.05,]
+
+results_in_kinobeads_names <- unique(results_in_KINOBEADS$hgnc_symbol)
+results_in_kinobeads_not_significant_names <- unique(results_in_KINOBEADS_filt$hgnc_symbol)
+results_in_kinobeads_not_clustered_names <-unique(results_in_KINOBEADS[results_in_KINOBEADS$proteoform_clustered == FALSE,]$hgnc_symbol)
+#what are the new unique ones that are in all proteoforms?
+results_in_kinobeads_names[results_in_kinobeads_names %!in% results_in_kinobeads_not_significant_names &
+                                 results_in_kinobeads_names %!in% results_in_kinobeads_not_clustered_names   ]
+
+# test_input <- data.matrix(data.frame("successes" = c(2, 4), "failures" = c(177-2, 12-4)))
+# prop.test(x = test_input)
+test_input <- data.matrix(data.frame("successes" = c(18, 5), "failures" = c(217-18, 12-5)))
+prop.test(x = test_input)
+
+.targets_listed$`SILAC hits` <- unique(silacdata$...3)
+targets_listed$`All cell line TPP hits, pAdj < 0.05` <- unique(hits_everything[hits_everything$pAdj < 0.05 &
+                                                                          hits_everything$type == "all",]$hgnc_symbol)
+
+#write out supp table 2, hits and sources
+table_targets <- data.frame("gene symbol" = "BTK", "source" = "intended target")
+for(i in 1:length(names(targets_listed))){
+  gene_symbols <- unlist(c(targets_listed[i]))
+  source_name <- names(targets_listed)[i]
+  sub_group_table <- data.frame("gene symbol" = gene_symbols, "source" =   source_name)
+
+  table_targets <- rbind(table_targets, sub_group_table)
+}
+rownames(table_targets) <- 1:919
+openxlsx::write.xlsx(table_targets, "output/supp_table_2_gene_symbol_hits_and_previous_studies.xlsx")
+
