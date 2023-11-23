@@ -1,0 +1,363 @@
+library(igraph)
+library(tidyverse)
+library(matrixStats)
+
+'%!in%' <- function(x,y)!('%in%' (x,y))
+setwd("~/path/")
+pulldown_data_psms <- as.data.frame(read.delim(file = "data/Pulldown/MultiConsensus_psms.txt"))
+graphs_comms <- readRDS("data/graphs_comms.RDS")
+hits_everything <- readRDS("output/hits_everything.RDS")
+#just significant
+hits_everything <- hits_everything[hits_everything$pAdj < 0.05,]
+
+# peptide_seq_list <- readRDS("path/peptide_seq_list.RDS")
+
+
+get_pulldown_and_annotate <- function(pulldown_data_psms, graphs_comms, ioi){peptide_seq_list <- list()
+
+
+peptide_seq_list[[ioi]] <- data.frame(
+  
+  as.data.frame(vertex_attr(graphs_comms[[ioi]])[["name"]]),
+  # as.data.frame(gsub("[0-9\\.\\+]", "",
+  #                    vertex_attr(graphs_comms[[i]])[["name"]])),
+  
+  as.data.frame(vertex_attr(graphs_comms[[ioi]])[["membership"]]))
+colnames(peptide_seq_list[[ioi]]) <- c("peptides", #"peptides_full", 
+                                     "membership" )
+
+
+# make_intensity_plot <- function(pulldown_data_psms, graphs_comms, ioi){
+#  
+# }
+transform_data <- function(data) {
+  # Replace letters preceeding +15.995 with lowercase letters
+  data <- gsub("(\\w)\\+15\\.995", "\\L\\1", data, perl = TRUE)
+  
+  # Replace letters preceeding +57.021 with lowercase letters
+  data <- gsub("(\\w)\\+57\\.021", "\\L\\1", data, perl = TRUE)
+  
+  # Remove all other +numbers
+  data <- gsub("\\+\\d+\\.\\d+", "", data)
+  
+  return(data)
+}
+
+#transform peptides
+peptide_seq_list[[ioi]]$peptides <- transform_data(data = peptide_seq_list[[ioi]]$peptides)
+
+#filter PSM file by ioi
+pulldown_data_psms_filt <- pulldown_data_psms[pulldown_data_psms$Sequence %in% peptide_seq_list[[ioi]]$peptides,]
+
+#label sample source
+pulldown_data_psms_filt$type <- grepl("DMSO", pulldown_data_psms_filt$Spectrum.File)
+
+pulldown_data_psms_filt$type <- gsub("TRUE", "DMSO", pulldown_data_psms_filt$type)
+pulldown_data_psms_filt$type <- gsub("FALSE", "IBRUTINIB", pulldown_data_psms_filt$type)
+
+pulldown_data_psms_filt$membership <- 0
+
+for(i in pulldown_data_psms_filt$Sequence){
+  
+  pulldown_data_psms_filt[pulldown_data_psms_filt$Sequence == i,]$membership <- 
+    peptide_seq_list[[ioi]][peptide_seq_list[[ioi]]$peptides == i,]$membership
+  
+}
+
+return(pulldown_data_psms_filt)
+
+}
+
+#test
+pulldown_data_psms_filt <- get_pulldown_and_annotate(pulldown_data_psms, graphs_comms, ioi = "BRAF")
+memberships_represented <- unique(pulldown_data_psms_filt$membership)
+
+#annotate the hits table
+hits_from_pulldown <- data.frame("id" = hits_everything$id, "gene symbol" = hits_everything$hgnc_symbol,
+                                 "test" = hits_everything$type, "pAdj" = hits_everything$pAdj)
+
+hits_from_pulldown$proteoform_ibrutinib_pulldown <- "N.D."
+hits_from_pulldown$proteoform_DMSO_pulldown <- "N.D."
+hits_from_pulldown$gene_ibrutinib_pulldown <- "N.D."
+hits_from_pulldown$gene_DMSO_pulldown <- "N.D."
+hits_from_pulldown <- hits_from_pulldown[!is.na(hits_from_pulldown$id),]
+
+# Filter out NAs in hits_from_pulldown$id
+hits_from_pulldown <- hits_from_pulldown[!is.na(hits_from_pulldown$id),]
+
+for (i in unique(hits_from_pulldown$gene.symbol)) {
+  pulldown_data_psms_filt <- tryCatch(
+    {get_pulldown_and_annotate(pulldown_data_psms, graphs_comms, ioi = i)},
+    error = function(e) { return(data.frame()) }  # Return an empty data frame on error
+  )
+  
+  if (nrow(pulldown_data_psms_filt) > 0) {
+    for (j in unique(pulldown_data_psms_filt$membership)) {
+      subset_id <- paste0(i, "_", j)
+      subset_condition <- hits_from_pulldown$id == subset_id
+      
+      if (sum(subset_condition) > 0) {
+        subset_row <- which(subset_condition)
+        
+        hits_from_pulldown$proteoform_DMSO_pulldown[subset_row] <- sum(
+          pulldown_data_psms_filt[pulldown_data_psms_filt$type == "DMSO" & 
+                                    subset_id %in% hits_from_pulldown$id,]$Intensity,
+          na.rm = TRUE
+        )
+        
+        hits_from_pulldown$proteoform_ibrutinib_pulldown[subset_row] <- sum(
+          pulldown_data_psms_filt[pulldown_data_psms_filt$type == "IBRUTINIB" & 
+                                    subset_id %in% hits_from_pulldown$id,]$Intensity,
+          na.rm = TRUE
+        )
+        
+        # Similarly update gene_DMSO_pulldown and gene_ibrutinib_pulldown
+        gene_symbol_pulldown <- unique(pulldown_data_psms_filt$Protein.Group.Accessions)
+        full_data_subset <- pulldown_data_psms$Protein.Group.Accessions %in% gene_symbol_pulldown 
+        
+        if(nrow(pulldown_data_psms[full_data_subset,]) > 0){
+          
+          hits_from_pulldown$gene_DMSO_pulldown[subset_row] <- sum(pulldown_data_psms[grepl("DMSO", pulldown_data_psms$Spectrum.File) &
+                                                                                        pulldown_data_psms$Protein.Group.Accessions %in% gene_symbol_pulldown,]$Intensity,
+                                                                   na.rm = TRUE)
+          
+          hits_from_pulldown$gene_ibrutinib_pulldown[subset_row] <- sum(pulldown_data_psms[!grepl("DMSO", pulldown_data_psms$Spectrum.File) &
+                                                                                        pulldown_data_psms$Protein.Group.Accessions %in% gene_symbol_pulldown,]$Intensity,
+                                                                   na.rm = TRUE)
+          
+        }
+      }
+    }
+  }
+  
+
+}
+
+
+openxlsx::write.xlsx(hits_from_pulldown, "output/pulldown_result_table_intensity.xlsx")
+
+#redo for everything
+
+#are any gene symbols missing from main dataset? add them
+hits_everything <- readRDS("output/hits_everything.RDS")
+library(biomaRt)
+mart <- useEnsembl(dataset = "hsapiens_gene_ensembl", biomart='ensembl')
+
+pulldown_ids <- getBM(attributes = c("uniprot_gn_id",#"pdb",
+                                    #"uniprot_gn_symbol",
+                                    "hgnc_symbol"
+),
+values = pulldown_data_psms$Protein.Group.Accessions,
+mart = mart)
+pulldown_ids <- pulldown_ids[!is.null(pulldown_ids$uniprot_gn_id) & !is.null(pulldown_ids$hgnc_symbol),]
+pulldown_ids_hngc <- unique(pulldown_ids$hgnc_symbol[(pulldown_ids$hgnc_symbol) %!in% hits_everything$hgnc_symbol])
+
+
+
+all_from_pulldown <- data.frame("id" = hits_everything$id, "gene symbol" = hits_everything$hgnc_symbol,
+                            "test" = hits_everything$type, "pAdj" = hits_everything$pAdj)
+
+pulldown_ids_hngc <- data.frame("id" = "N.D.", "gene symbol" = pulldown_ids_hngc,
+                                "test" = "pulldown only", "pAdj" = "N.D.")
+all_from_pulldown <- rbind(all_from_pulldown, pulldown_ids_hngc)
+
+merge_columns <- unique(pulldown_data_psms$Spectrum.File)
+
+for (new_col_name in merge_columns) {
+  all_from_pulldown[[new_col_name]] <- "N.D"
+}
+
+
+
+all_from_pulldown$proteoform_ibrutinib_pulldown <- "N.D."
+all_from_pulldown$proteoform_DMSO_pulldown <- "N.D."
+all_from_pulldown$gene_ibrutinib_pulldown <- "N.D."
+all_from_pulldown$gene_DMSO_pulldown <- "N.D."
+all_from_pulldown$peptides_proteoform <- "N.D."
+all_from_pulldown$peptides_gene_symbol <- "N.D."
+all_from_pulldown <-all_from_pulldown[!is.na(all_from_pulldown$id),]
+
+for (i in unique(all_from_pulldown$gene.symbol)) {
+  pulldown_data_psms_filt <- tryCatch(
+    {get_pulldown_and_annotate(pulldown_data_psms, graphs_comms, ioi = i)},
+    error = function(e) { return(data.frame()) }  # Return an empty data frame on error
+  )
+  
+  if (nrow(pulldown_data_psms_filt) > 0) {
+    for (j in unique(pulldown_data_psms_filt$membership)) {
+      subset_id <- paste0(i, "_", j)
+      subset_condition <- all_from_pulldown$id == subset_id
+      
+      if (sum(subset_condition) > 0) {
+        subset_row <- which(subset_condition)
+        
+        all_from_pulldown$proteoform_DMSO_pulldown[subset_row] <- sum(
+          pulldown_data_psms_filt[pulldown_data_psms_filt$type == "DMSO" & 
+                                    subset_id %in% all_from_pulldown$id,]$Intensity,
+          na.rm = TRUE
+        )
+        
+        all_from_pulldown$proteoform_ibrutinib_pulldown[subset_row] <- sum(
+          pulldown_data_psms_filt[pulldown_data_psms_filt$type == "IBRUTINIB" & 
+                                    subset_id %in% all_from_pulldown$id,]$Intensity,
+          na.rm = TRUE
+        )
+        for(k in unique(pulldown_data_psms_filt$Spectrum.File)){
+          
+          all_from_pulldown[[k]][subset_row] <- sum(
+            pulldown_data_psms_filt[pulldown_data_psms_filt$Spectrum.File == k & 
+                                      subset_id %in% all_from_pulldown$id,]$Intensity,
+            na.rm = TRUE
+          )
+          
+        }
+        
+        # Similarly update gene_DMSO_pulldown and gene_ibrutinib_pulldown
+        gene_symbol_pulldown <- unique(pulldown_data_psms_filt$Protein.Group.Accessions)
+        full_data_subset <- pulldown_data_psms$Protein.Group.Accessions %in% gene_symbol_pulldown 
+        
+        if(nrow(pulldown_data_psms[full_data_subset,]) > 0){
+          
+          all_from_pulldown$gene_DMSO_pulldown[subset_row] <- sum(pulldown_data_psms[grepl("DMSO", pulldown_data_psms$Spectrum.File) &
+                                                                                        pulldown_data_psms$Protein.Group.Accessions %in% gene_symbol_pulldown,]$Intensity,
+                                                                   na.rm = TRUE)
+          
+          all_from_pulldown$gene_ibrutinib_pulldown[subset_row] <- sum(pulldown_data_psms[!grepl("DMSO", pulldown_data_psms$Spectrum.File) &
+                                                                                             pulldown_data_psms$Protein.Group.Accessions %in% gene_symbol_pulldown,]$Intensity,
+                                                                        na.rm = TRUE)
+          
+        }
+      }
+    }
+  }
+  
+  
+}
+
+saveRDS(all_from_pulldown, "data/Pulldown/all_from_pulldown_raw.RDS")
+all_from_pulldown <- readRDS("data/Pulldown/all_from_pulldown_raw.RDS")
+
+# only ones with peptides detected in both
+all_from_pulldown <- all_from_pulldown[all_from_pulldown$proteoform_ibrutinib_pulldown != "N.D." & 
+                                         all_from_pulldown$proteoform_DMSO_pulldown != "N.D.",]
+# df_long <- all_from_pulldown  %>%
+#   pivot_longer(cols = c("proteoform_ibrutinib_pulldown", "proteoform_DMSO_pulldown"), names_to = "Label", values_to = "Value")
+# df_long$Value <- log2(as.numeric(df_long$Value ) +1)
+# 
+# pdf(file = "output/rawdata_proteoformmatches_pulldown.pdf", width = 10, height = 5)
+# 
+# ggplot(df_long , aes(x = Label, y = Value)) +geom_boxplot()
+# dev.off()
+
+#center the matrix
+# #scale each proteoform to be centered at zero within the meltome cell line data subset
+# exprs(proteoform_abundance) <- log2(exprs(proteoform_abundance))
+all_from_pulldown_mat <- all_from_pulldown[,c("id",merge_columns)]
+all_from_pulldown_mat <- unique(all_from_pulldown_mat)
+#all_from_pulldown_mat[,merge_columns] <- log2(data.matrix(all_from_pulldown_mat[,merge_columns]))
+
+#NormFactors <- rowMedians(data.matrix(all_from_pulldown_mat[,merge_columns]), na.rm = TRUE)
+
+#all_from_pulldown_mat[,merge_columns] <- t(scale(t(all_from_pulldown_mat[,merge_columns]), center = NormFactors, scale = FALSE))
+colnames(all_from_pulldown_mat) <- gsub("20171124_JERF_", "", colnames(all_from_pulldown_mat))
+colnames(all_from_pulldown_mat) <- gsub(".raw", "", colnames(all_from_pulldown_mat))
+
+df_long <- all_from_pulldown_mat  %>%
+     pivot_longer(cols = colnames(all_from_pulldown_mat)[2:13], names_to = "Label", values_to = "Value")
+df_long$type <- grepl("PROBE", df_long$Label)
+df_long$type <- gsub("TRUE", "IBRUTINIB", df_long$type)
+df_long$type <- gsub("FALSE", "DMSO", df_long$type)
+df_long$dose <- grepl("11|12|13", df_long$Label)
+df_long$dose <- gsub("TRUE", "100nM", df_long$dose)
+df_long$dose <- gsub("FALSE", "20uM", df_long$dose)
+df_long$p_val <- 1
+df_long$Value <- as.numeric(df_long$Value )
+
+df_long$Value_Plot <- as.numeric(df_long$Value )
+#perform t tests
+for(i in unique(df_long$id)){
+  
+  for(j in unique(df_long$dose)){
+    if(sum(is.na(df_long[df_long$id == i & 
+                         df_long$dose == j & 
+                         df_long$type == "IBRUTINIB",]$Value)) < 2 & 
+       sum(is.na(df_long[df_long$id == i & 
+                         df_long$dose == j & 
+                         df_long$type == "DMSO",]$Value)) < 2 ){
+    df_long[df_long$id == i & df_long$dose == j,]["p_val"] <- t.test(x = df_long[df_long$id == i & 
+                                                                                df_long$dose == j & 
+                                                                                df_long$type == "IBRUTINIB",]$Value,
+                                                                  y =  df_long[df_long$id == i & 
+                                                                                 df_long$dose == j & 
+                                                                                 df_long$type == "DMSO",]$Value,
+                                                                  paired = FALSE)$p.value
+    
+    df_long[df_long$id == i & df_long$dose == j & df_long$type == "DMSO",]["Value_Plot"] <- mean(df_long[df_long$id == i & 
+                                                                                                   df_long$dose == j & 
+                                                                                                   df_long$type == "DMSO",]$Value, na.rm = TRUE)
+    
+    }
+    if(sum(is.na(df_long[df_long$id == i & 
+                         df_long$dose == j & 
+                         df_long$type == "IBRUTINIB",]$Value)) < 2 & 
+       sum(is.na(df_long[df_long$id == i & 
+                         df_long$dose == j & 
+                         df_long$type == "DMSO",]$Value)) >= 2 ){
+      
+      df_long[df_long$id == i & df_long$dose == j & df_long$type == "IBRUTINIB",]["Value_Plot"] <- mean(df_long[df_long$id == i & 
+                                                                                                     df_long$dose == j & 
+                                                                                                     df_long$type == "IBRUTINIB",]$Value, na.rm = TRUE)
+      
+    }
+    
+    if(sum(is.na(df_long[df_long$id == i & 
+                         df_long$dose == j & 
+                         df_long$type == "IBRUTINIB",]$Value)) >= 2 & 
+       sum(is.na(df_long[df_long$id == i & 
+                         df_long$dose == j & 
+                         df_long$type == "DMSO",]$Value)) < 2 ){
+      
+      df_long[df_long$id == i & df_long$dose == j & df_long$type == "IBRUTINIB",]["Value_Plot"] <- mean(df_long[df_long$id == i & 
+                                                                                                          df_long$dose == j & 
+                                                                                                          df_long$type == "IBRUTINIB",]$Value, na.rm = TRUE)
+      
+    }
+    
+  }
+  
+}
+
+df_long_merge <- left_join(df_long, y = hits_everything[hits_everything$type == "RCH-ACV", ], by = "id")
+df_long_merge <- df_long_merge[!is.na(df_long_merge$Value), ]
+df_long_merge <- full_join(df_long_merge[df_long_merge$type.x == "IBRUTINIB",], df_long_merge[df_long_merge$type.x == "DMSO",], by = "id")
+pdf(file = "output/rawdata_proteoformmatches_pulldown.pdf", width = 10, height = 5)
+
+ggplot(df_long_merge[df_long_merge$type.x.x == "IBRUTINIB",] , aes(x = pAdj.y, y = log2(Value.x - Value.y), color = id == "BTK_1")) +geom_point() +
+  ylab("log2(Pulldown intensity ibrutinib - DMSO)") + xlab("pAdj, NPARC") + ggpubr::theme_pubr()
+dev.off()
+
+#COG3 - no peptides
+#GSK3B - only proteoform 1 peptides
+#BRAF - only proteoform 1
+#BTK - 1 and 2
+#YES1 - only 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
