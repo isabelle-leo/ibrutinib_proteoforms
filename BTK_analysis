@@ -1,0 +1,803 @@
+
+library(Biobase)
+library(dplyr)
+library(purrr)
+library(biobroom)
+library(ggplot2)
+library(ggthemes)
+library(ggpubr)
+library(stringr)
+library(matrixStats)
+library(NGLVieweR)
+library(curl)
+library(ComplexHeatmap)
+library(circlize)
+
+options(stringsAsFactors = FALSE, scipen = 9999)
+
+colors                        <- c("#71BC78", "#FF9BAA", "#7c827c", "#FD5E53", "#FD7C6E",
+                                   "#1974D2", "#1DACD6", "#71BC78", "#1CAC78", "#FCD975",
+                                   "#FCE883", "#FDFC74", "#bbbbfa", "#CDA4DE", "#A2ADD0",
+                                   "#1DACD6", "#ECEABE", "#9D81BA", "#FFA089", "#FC6C85",
+                                   "#EFCDB8", "#F664AF", "#E6A8D7", "#FC6C85", "gray",
+                                   "#5C80BC", "#CDD1C4", "#B5CA8D", "#1B264F", "#B5CA8D", "#885053")
+names(colors)                 <- c(1:length(colors))
+
+plot_proteoform <- function (ioi,
+                             e_set,
+                             x_col = "sample_name",
+                             facet_col = NULL,
+                             color_col = "membership",
+                             colors = c("1" = "#FF5376",
+                                        "2" = "#72AFD9",
+                                        "3" = "#E3D26F",
+                                        "4" = "#A288E3",
+                                        "5" = "#1B5299",
+                                        "6" = "#68D8D6",
+                                        "NA" = "#494e57"),
+                             add_splines = FALSE,
+                             hide_lines = FALSE,
+                             line_col = NULL,
+                             x_label = "Sample name",
+                             y_label = "log2 proteoform level",
+                             y_limits = c(-0.2, 1.2),
+                             custom_theme = NULL) {
+  
+  ioi_proteoforms <- e_set[fData(e_set)$ioi == ioi, ]
+  
+  if (nrow(ioi_proteoforms) == 0) stop("No data found for this ID of interest.")
+  
+  data <- ioi_proteoforms %>%
+    tidy.ExpressionSet(addPheno = TRUE) %>%
+    set_names(gsub("^gene$", "proteoform_id", colnames(.))) %>%
+    left_join(fData(ioi_proteoforms), by = "proteoform_id") %>%
+    mutate(membership = as.factor(membership))
+  
+  data$x_col <- data[[x_col]]
+  data$color_col <- data[[color_col]]
+  
+  if (!is.null(facet_col) & facet_col == "sample_split") {
+    facet_col_plot <- as.data.frame(data)
+    facets_plot <- paste0( facet_col_plot$sample_name_machine, ", proteoform ", facet_col_plot$membership)
+    data$sample_split <- facets_plot
+    # p <- p + facet_wrap(facets = facets_plot)
+  }
+  
+  p <- data %>%
+    ggplot(aes(x = x_col,
+               y = value,
+               group = interaction(proteoform_id, sample_name),
+               color = color_col)) +
+    geom_point() +
+    scale_color_manual(values = colors, name = color_col) +
+    ylim(y_limits)
+  
+  if (!hide_lines) {
+    p <- p + geom_line(alpha = .7)
+  }
+  
+  if (add_splines & is.null(line_col) & facet_col != "sample_split") {
+    p <- p + geom_smooth(method = "lm", formula = 'y ~ splines::ns(x, df = 4)', se = FALSE, alpha = .4, size = .7)
+  }
+  if (add_splines & !is.null(line_col)& facet_col == "sample_split") {
+    p <- p + geom_smooth(aes(x = x_col,
+                             y = value,
+                             group = interaction(sample_split, treatment), linetype = treatment), method = "lm", formula = 'y ~ splines::ns(x, df = 4)', se = FALSE, alpha = .4, size = .7)
+  }
+  if (add_splines & !is.null(line_col)& facet_col != "sample_split"& facet_col != "sample_separate") {
+    line_col_plot <- as.data.frame(data)
+    treatment <- line_col_plot[,line_col]
+    p <- p + geom_smooth(aes(linetype = treatment), method = "lm", formula = 'y ~ splines::ns(x, df = 4)', se = FALSE, alpha = .4, size = .7)
+  }
+  
+  if (add_splines & !is.null(line_col)& facet_col == "sample_separate") {
+    line_col_plot <- as.data.frame(data)
+    treatment <- line_col_plot[,line_col]
+    p <- p + geom_smooth(aes(x = x_col,
+                    y = value,
+                    group = interaction(sample_name_machine, membership, treatment), linetype = treatment, color = color_col), method = "lm", formula = 'y ~ splines::ns(x, df = 4)', se = FALSE, alpha = .4, size = .7)
+  }
+  
+  if (!is.null(facet_col) ) {
+    p <- p + facet_wrap(facets = facet_col)
+  }
+  
+  if (!is.null(custom_theme)) {
+    p <- p + custom_theme()
+  }
+  
+  p <- p +
+    xlab(x_label) + ylab(y_label) +
+    ggtitle(ioi) +
+    theme(legend.position = "bottom")
+  
+  print(p)
+  
+  return(p)
+}
+
+
+get_peptide_numeric <- function(fasta_list, peptide_seq_list){
+  peptide_indices <- list()
+  for( i in 1:length(peptide_seq_list$peptides)){
+    peptide_indices[[rownames(peptide_seq_list[i,])]] <- data.frame(nchar(gsub(paste0(peptide_seq_list$peptides[i], ".*"), "", fasta_list)),
+                                                                    peptide_seq_list$peptide[i],
+                                                                    peptide_seq_list$membership[i])
+    names(peptide_indices[[rownames(peptide_seq_list[i,])]]) <- c("start_position", "peptide")
+  }
+  return(peptide_indices)
+}
+
+get_alphafold_file <- function(ioi, uniprot_ids){
+  
+  uniprot_ids_options <- length(uniprot_ids[uniprot_ids$hgnc_symbol == ioi,]$uniprot_gn_id) +1
+  request_num <- 1
+  
+  uniprot_ioi <- uniprot_ids[uniprot_ids$hgnc_symbol == ioi,]$uniprot_gn_id[request_num]
+  #add the file type
+  alphafold_path <- paste0(tempfile(), ".pdb")
+  alphafold_file <- curl_fetch_disk(url = paste0("https://alphafold.ebi.ac.uk/files/AF-",uniprot_ioi,"-F1-model_v4.pdb"),
+                                    handle = new_handle(),
+                                    path = alphafold_path)
+  
+  while(request_num < uniprot_ids_options & alphafold_file[["status_code"]] == 404){
+    request_num <-  request_num +1
+    uniprot_ioi <- uniprot_ids[uniprot_ids$hgnc_symbol == ioi,]$uniprot_gn_id[request_num]
+    alphafold_file <- curl_fetch_disk(url = paste0("https://alphafold.ebi.ac.uk/files/AF-",uniprot_ioi,"-F1-model_v4.pdb"),
+                                      handle = new_handle(),
+                                      path = alphafold_path)
+  }
+  
+  return(alphafold_file)
+}
+
+#function below taken from RCPI package, https://github.com/nanxstats/Rcpi/blob/HEAD/R/501-readFASTA.R
+
+readFASTA = function (file = system.file('protseq/P00750.fasta',
+                                         package = 'Rcpi'),
+                      legacy.mode = TRUE, seqonly = FALSE) {
+  
+  # Read the fasta file as a vector of strings
+  lines = readLines(file)
+  
+  # Remove comment lines starting with a semicolon ';'
+  if (legacy.mode) {
+    comments = grep("^;", lines)
+    if (length(comments) > 0) {
+      lines = lines[-comments]
+    }
+  }
+  
+  # Get the line numbers where sequences names are
+  ind = which(substr(lines, 1L, 1L) == ">")
+  
+  # Compute the total number of sequences
+  nseq = length(ind)
+  
+  if (nseq == 0) stop("no line starting with a > character found")
+  
+  # Localize sequence data
+  start = ind + 1
+  end = ind - 1
+  end = c(end[-1], length(lines))
+  
+  # Read in sequences
+  sequences = lapply(seq_len(nseq),
+                     function(i) paste(lines[start[i]:end[i]], collapse = ""))
+  
+  if (seqonly) return(sequences)
+  
+  # Read in sequence names
+  nomseq = lapply(seq_len(nseq), function (i) {
+    firstword = strsplit(lines[ind[i]], " ")[[1]][1]
+    substr(firstword, 2, nchar(firstword))
+  })
+  
+  # Give the sequences names to the list elements
+  names(sequences) = nomseq
+  
+  return(sequences)
+  
+}
+
+pdb_plot <- function(ioi, pdb_ids, peptide_seq_list_file, fasta_file, membership_colors = membership_colors){
+  peptide_seq_list <- readRDS(peptide_seq_list_file)
+  peptide_seq_list <- peptide_seq_list[[ioi]]
+  fasta_list <- readRDS(fasta_file)
+  fasta_list <- fasta_list[[ioi]][[1]]
+  peptide_indices <- tryCatch({get_peptide_numeric(fasta_list, peptide_seq_list)},
+                              error = function(e){0})
+  ioi_pdb <- pdb_ids[pdb_ids$hgnc_symbol == ioi &
+                       pdb_ids$pdb != "",]
+  
+  if (nrow(ioi_pdb) == 0) stop("No PDB structure was found for this ID of interest.")
+  
+  if (!is.list(peptide_indices)){p <- NGLVieweR(ioi_pdb[1,]$pdb) %>%
+    addRepresentation("cartoon", param = list(name = "cartoon", backgroundColor = "white", colorScheme = "uniform", colorValue = "#808080")) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("low") %>%
+    setFocus(0) %>%
+    setSpin(TRUE)
+  return(p) }else if(is.list(peptide_indices)){ p <- NGLVieweR(ioi_pdb[1,]$pdb) %>%
+    addRepresentation("tube", param = list(name = "tube", backgroundColor = "white", colorScheme = "uniform", colorValue = "#808080")) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("low") %>%
+    setFocus(0) %>%
+    setSpin(TRUE)
+  for(i in 1:length(peptide_seq_list$peptides)){
+    
+    tryCatch({p <- p %>% addRepresentation("surface", param = list(
+      colorScheme = "residue",
+      colorValue = as.character(membership_colors[peptide_seq_list[i,]$membership]),
+      sele = paste0(peptide_indices[[i]]$start_position, "-", 
+                    nchar(peptide_indices[[i]]$peptide) + peptide_indices[[i]]$start_position),
+      opacity = 0.25
+    ))},
+    error = function(e){e})
+    
+    
+  }
+  
+  
+  }
+  return(p)
+  #return the first pdb structure if there are multiple
+  
+  
+  
+}
+
+get_FASTA_fromalphafold <- function(alphafold_file){
+  
+  uniprot_ioi <- gsub("https://alphafold.ebi.ac.uk/files/AF-", "", alphafold_file[["url"]])
+  uniprot_ioi <- gsub("-F1-model_v4.pdb", "", uniprot_ioi)
+  
+  #add the file type
+  FASTA_path <- paste0(tempfile(), ".fasta")
+  FASTA_file <- curl_fetch_disk(url = paste0('https://rest.uniprot.org/uniprotkb/', uniprot_ioi, '.fasta'),
+                                handle = new_handle(),
+                                path = FASTA_path)
+  
+  AASeq <- readFASTA(file = FASTA_file[["content"]])
+  
+  unlink(FASTA_path)
+  
+  # while(request_num <= uniprot_ids_options & alphafold_file[["status_code"]] == 404){
+  #   request_num <-  request_num +1
+  #   uniprot_ioi <- uniprot_ids[uniprot_ids$hgnc_symbol == ioi,]$uniprot_gn_id[request_num]
+  #   alphafold_file <- curl_fetch_disk(url = paste0("https://alphafold.ebi.ac.uk/files/AF-",uniprot_ioi,"-F1-model_v4.pdb"),
+  #                                     handle = new_handle(),
+  #                                     path = alphafold_path)
+  # }
+  
+  return(AASeq)
+}
+
+alphafold_plot <- function(ioi, uniprot_ids, peptide_seq_list_file = NULL, fasta_file = NULL, membership_colors = membership_colors){
+  if(!is_null(peptide_seq_list_file)){peptide_seq_list <- readRDS(peptide_seq_list_file)
+  peptide_seq_list <- peptide_seq_list[[ioi]]}else{stop("No peptide membership data provided.")}
+  
+  ioi_alphafold <- tryCatch({get_alphafold_file(ioi, uniprot_ids)},
+                            error = function(e){0})
+  
+  if(!is_null(fasta_file)){fasta_list <- readRDS(fasta_file)
+  fasta_list <- fasta_list[[ioi]][[1]]}else{
+    #read a FASTA from uniprot
+    #refer to alpha fold so FASTA is consistent
+    fasta_list <- get_FASTA_fromalphafold(ioi_alphafold)
+    
+  }
+  
+  peptide_indices <- tryCatch({get_peptide_numeric(fasta_list, peptide_seq_list)},
+                              error = function(e){0})
+  
+  
+  
+  if (ioi_alphafold[["status_code"]] == 404) stop("No AlphaFold structure was found for this ID of interest.")
+  
+  if (!is.list(peptide_indices)){p <- NGLVieweR(ioi_alphafold[["content"]]) %>%
+    addRepresentation("cartoon", param = list(name = "cartoon", backgroundColor = "white", colorScheme = "uniform", colorValue = "#808080")) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("low") %>%
+    setFocus(0) %>%
+    setSpin(TRUE)
+  return(p) }else if(is.list(peptide_indices)){ p <- NGLVieweR(ioi_alphafold[["content"]]) %>%
+    addRepresentation("tube", param = list(name = "tube", backgroundColor = "white", colorScheme = "uniform", colorValue = "#808080")) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("low") %>%
+    setFocus(0) %>%
+    setSpin(TRUE)
+  for(i in 1:length(peptide_seq_list$peptides)){
+    
+    tryCatch({p <- p %>% addRepresentation("surface", param = list(
+      colorScheme = "residue",
+      colorValue = as.character(membership_colors[peptide_seq_list[i,]$membership]),
+      sele = paste0(peptide_indices[[i]]$start_position, "-", 
+                    nchar(peptide_indices[[i]]$peptide) + peptide_indices[[i]]$start_position),
+      opacity = 0.25
+    ))},
+    error = function(e){e})
+    
+    
+  }
+  
+  
+  }
+  return(p)
+  #return the first pdb structure if there are multiple
+  
+  unlink(ioi_alphafold[["content"]])
+  
+}
+
+alphafold_plot_special <- function(ioi, uniprot_ids, peptide_seq_list_file = NULL, fasta_file = NULL, membership_colors = membership_colors, special = "165"){
+  if(!is.null(peptide_seq_list_file)){peptide_seq_list <- readRDS(peptide_seq_list_file)
+  peptide_seq_list <- peptide_seq_list[[ioi]]}else{stop("No peptide membership data provided.")}
+  
+  ioi_alphafold <- tryCatch({get_alphafold_file(ioi, uniprot_ids)},
+                            error = function(e){0})
+  
+  if(!is.null(fasta_file)){fasta_list <- readRDS(fasta_file)
+  fasta_list <- fasta_list[[ioi]][[1]]}else{
+    #read a FASTA from uniprot
+    #refer to alpha fold so FASTA is consistent
+    fasta_list <- get_FASTA_fromalphafold(ioi_alphafold)
+    
+  }
+  
+  peptide_indices <- tryCatch({get_peptide_numeric(fasta_list, peptide_seq_list)},
+                              error = function(e){0})
+  
+  
+  
+  if (ioi_alphafold[["status_code"]] == 404) stop("No AlphaFold structure was found for this ID of interest.")
+  
+  if (!is.list(peptide_indices)){p <- NGLVieweR(ioi_alphafold[["content"]]) %>%
+    addRepresentation("cartoon", param = list(name = "tube", backgroundColor = "white", colorScheme = "uniform", colorValue = "#808080")) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("low") %>%
+    setFocus(0) %>%
+    setSpin(FALSE)
+  return(p) }else if(is.list(peptide_indices) & !is.null(special)){ p <- NGLVieweR(ioi_alphafold[["content"]]) %>%
+    addRepresentation("ball+stick", param = list(name = "ball+stick", backgroundColor = "white", colorScheme = "uniform", colorValue = "gray90", opacity = 1)) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("high") %>%
+    setFocus(0) %>%
+    setSpin(FALSE)%>%
+    addRepresentation("ball+stick",
+                      param = list(
+                        name = "label",
+                        colorScheme = "uniform",
+                        showBackground = TRUE,
+                        labelType = "res",
+                        colorValue = "gold",
+                        backgroundColor = "white",
+                        opacity = 1,
+                        backgroundOpacity = 0.8,
+                        sele = special
+                      )
+    )
+  for(i in 1:length(peptide_seq_list$peptides)){
+    
+    tryCatch({p <- p %>% addRepresentation("tube", param = list(
+      colorScheme = "uniform", #residue
+      colorValue = as.character(membership_colors[peptide_seq_list[i,]$membership]),
+      sele = paste0(peptide_indices[[i]]$start_position, "-", 
+                    nchar(peptide_indices[[i]]$peptide) + peptide_indices[[i]]$start_position)
+    ))},
+    error = function(e){e})
+    
+    
+  }
+  
+  
+  
+  
+  }else if(is.list(peptide_indices) & is.null(special)){ p <- NGLVieweR(ioi_alphafold[["content"]]) %>%
+    addRepresentation("ball+stick", param = list(name = "ball+stick", backgroundColor = "white", colorScheme = "uniform", colorValue = "gray90", opacity = 1)) %>%
+    stageParameters(backgroundColor = "white", colorValue = "#808080") %>%
+    setQuality("high") %>%
+    setFocus(0) %>%
+    setSpin(FALSE)
+  for(i in 1:length(peptide_seq_list$peptides)){
+    
+    tryCatch({p <- p %>% addRepresentation("tube", param = list(
+      colorScheme = "uniform", #residue
+      colorValue = as.character(membership_colors[peptide_seq_list[i,]$membership]),
+      sele = paste0(peptide_indices[[i]]$start_position, "-", 
+                    nchar(peptide_indices[[i]]$peptide) + peptide_indices[[i]]$start_position)
+    ))},
+    error = function(e){e})
+    
+    
+  }
+  
+  
+  
+  
+  }
+  return(p)
+  #return the first pdb structure if there are multiple
+  
+  unlink(ioi_alphafold[["content"]])
+  
+}
+
+
+tidy_e_set <- function (e_set) {
+  
+  df <- e_set %>%
+    exprs() %>%
+    as.data.frame() %>%
+    cbind(., fData(e_set)) %>%
+    gather(key = "sample_id", value = "value", seq_len(ncol(e_set))) %>%
+    left_join(pData(e_set), by = "sample_id")
+  
+  return(df)
+}
+
+get_color_vector <- function (colors,
+                              vec,
+                              gray = "#494e57") {
+  
+  n <- length(unique(vec))
+  
+  suppl_needed <- max(n - length(colors), 0)
+  col_suppl <- c(colors[1:min(n, length(colors))], rep(gray, suppl_needed))
+  
+  # count appearances of each group
+  vec_accum <- table(vec) %>% sort(decreasing = TRUE)
+  
+  names(col_suppl) <- names(vec_accum) %>% as.character()
+  
+  # add a gray missing value
+  col_suppl <- c(col_suppl, c("0" = gray))
+  
+  return(col_suppl)
+}
+
+# set the membership colors
+palette <- c("#FF5376", "#72AFD9", "#E3D26F", "#A288E3", "#1B5299", "#68D8D6", "#B78DA3")
+membership_colors <- c(get_color_vector(colors = palette, vec = seq_len(6)), "protein" = "#494e57")
+
+build_ratios_to_lowest_temperature <- function (e_set,
+                                                sample_col = "sample_name") {
+  
+  # separate by sample
+  sample_names <- e_set %>%
+    pData() %>%
+    .[[sample_col]] %>%
+    unique()
+  
+  ratio_matrices <- sapply(X = sample_names,
+                           FUN = function (current_sample_name) {
+                             # subset
+                             e_set_sample <- e_set[, pData(e_set)[[sample_col]] == current_sample_name]
+                             
+                             # lowest temperature column
+                             denom_col <- e_set_sample %>%
+                               pData() %>%
+                               filter(temperature == min(temperature)) %>%
+                               .$sample_id
+                             
+                             ratio_matrix <- e_set_sample %>%
+                               exprs() %>%
+                               sweep(MARGIN = 1,
+                                     STATS = .[, denom_col],
+                                     FUN = "/")
+                             
+                             return(ratio_matrix)
+                           },
+                           simplify = FALSE,
+                           USE.NAMES = TRUE)
+  
+  combined_ratio_matrices <- do.call(cbind, ratio_matrices)
+  
+  # replace non-finite values by NA
+  combined_ratio_matrices[!is.finite(combined_ratio_matrices)] <- NA
+  
+  # change row order to original ExpressionSet
+  combined_ratio_matrices <- combined_ratio_matrices[, colnames(exprs(e_set))]
+  
+  # check, if the colnames are still in original order
+  stopifnot(identical(colnames(exprs(e_set)), colnames(combined_ratio_matrices)))
+  
+  # assign matrix to ExpressionSet
+  ratios_e_set <- e_set
+  exprs(ratios_e_set) <- combined_ratio_matrices
+  
+  return(ratios_e_set)
+}
+
+
+interpro_plot <- function(ioi, interpro_file, uniprot_ids, peptide_seq_list_file = NULL, fasta_file = NULL, 
+                          membership_colors = membership_colors, interpro_colors = c("#FF5376", "#72AFD9", "#E3D26F", "#A288E3", "#1B5299", "#68D8D6", "#B78DA3")){
+  
+  interpro_ioi <- read.csv(interpro_file)
+  interpro_ioi <- interpro_ioi[interpro_ioi$hgnc_symbol == ioi & !is.null(interpro_ioi$interpro_description) & !is.na(interpro_ioi$interpro_description),]
+  
+  ioi_alphafold <- tryCatch({get_alphafold_file(ioi, uniprot_ids)},
+                            error = function(e){0})
+  
+  if(!is.null(fasta_file)){fasta_list <- readRDS(fasta_file)
+  fasta_list <- fasta_list[[ioi]][[1]]}else{
+    #read a FASTA from uniprot
+    #refer to alpha fold so FASTA is consistent
+    fasta_list <- get_FASTA_fromalphafold(ioi_alphafold)
+    
+  }
+  
+  peptide_seq_list <- readRDS(peptide_seq_list_file)
+  peptide_seq_list <- peptide_seq_list[[ioi]]
+  peptide_indices <- tryCatch({get_peptide_numeric(fasta_list, peptide_seq_list)},
+                              error = function(e){0})
+  #retrieve from alphafold so it's consistent with the other visualizations in 3D
+  
+  interpro_options <- unique(interpro_ioi$interpro_description)
+  
+  meta_hmap <- matrix(nrow = nchar(fasta_list[[1]]), ncol = length(c("Amino acid residue", "Membership", interpro_options)))
+  colnames(meta_hmap) <- c("Amino acid residue", "Membership", interpro_options)
+  meta_hmap[,'Amino acid residue'] <- as.numeric(1:nchar(fasta_list[[1]]))
+  
+  #populate the heatmap
+  for(i in as.numeric(meta_hmap[,'Amino acid residue'])){
+    
+    for(j in 1:nrow(interpro_ioi)){
+      
+      if(i >= interpro_ioi$interpro_start[j] & i <= interpro_ioi$interpro_end[j]){
+        
+        meta_hmap[meta_hmap[,'Amino acid residue'] == i,interpro_ioi$interpro_description[j]] <- interpro_ioi$interpro_description[j]
+        
+      }
+      
+    }
+    
+    for(k in 1:length(peptide_indices)){
+      
+      if(as.numeric(peptide_indices[[k]][["start_position"]]) <= i & 
+         as.numeric(nchar(peptide_indices[[k]][["peptide"]]) + peptide_indices[[k]][["start_position"]]) >= i){
+        
+        if(!is.na(meta_hmap[,"Membership"][i]) & meta_hmap[,"Membership"][i] != peptide_indices[[k]][[3]]){
+          meta_hmap[,"Membership"][i] <- paste0("Multiple")
+        }else(
+          meta_hmap[,"Membership"][i] <- peptide_indices[[k]][[3]]
+        ) #end ifelse for membership discovery
+        
+        
+        
+      }
+      
+    }
+    
+  }
+  
+  
+  #make sure it's numeric 
+  meta_hmap <- as.data.frame(meta_hmap)
+  meta_hmap[,'Amino acid residue'] <- as.numeric(meta_hmap[,'Amino acid residue'])
+  #make color for multi mapping 
+  membership_colors["Multiple"] <- "#494e57"
+  
+  #make it horizontal
+  #meta_hmap <- as.data.frame(t(meta_hmap))
+  
+  #set legend things to hide
+  legend_logical <- logical(length = length(colnames(meta_hmap)))
+  legend_logical[1] <- TRUE
+  legend_logical[2] <- TRUE
+  if(length(colnames(meta_hmap)) >= 3){for (i in 3:length(colnames(meta_hmap))){
+    
+    legend_logical[i] <- FALSE
+    
+  }
+    metadata_annotation_obj <- HeatmapAnnotation(df = meta_hmap, na_col = "white", col = 
+                                                   list(
+                                                     "Membership" = membership_colors
+                                                   ),
+                                                 show_legend = legend_logical,
+                                                 which = "col")
+    
+    plot(metadata_annotation_obj)
+    return(metadata_annotation_obj)
+  }}
+
+
+###################
+###################
+###################
+
+proteoforms <- readRDS("path/proteoforms.RDS")
+proteoforms$treatment <- c("IBRUTINIB", "IBRUTINIB", "IBRUTINIB", "IBRUTINIB","IBRUTINIB",
+                               "IBRUTINIB", "IBRUTINIB", "IBRUTINIB", "IBRUTINIB","IBRUTINIB",
+                               "IBRUTINIB", "IBRUTINIB", "IBRUTINIB", "IBRUTINIB","IBRUTINIB",
+                               "IBRUTINIB", "IBRUTINIB", "IBRUTINIB", "IBRUTINIB","IBRUTINIB",
+                               "DMSO", "DMSO", "DMSO", "DMSO", "DMSO",
+                               "DMSO", "DMSO", "DMSO", "DMSO", "DMSO",
+                               "DMSO", "DMSO", "DMSO", "DMSO", "DMSO",
+                               "DMSO", "DMSO", "DMSO", "DMSO", "DMSO")
+
+pdf(file = "output/BTK_bytreatment_proteoform_melting.pdf", width = 5.5, height = 3.5)
+ggarrange(plot_proteoform(ioi = "BTK",
+                e_set = proteoforms ,
+                x_col = "temperature",
+                facet_col = "membership",
+                colors = c("IBRUTINIB" = "red", "DMSO" = "#04ABEC"),
+                add_splines = FALSE,
+                color_col = "Treatment") +
+  xlab("Temperature") +
+  ylab("Fraction non-denatured")+
+  ggtitle(paste0("BTK", " proteoform melting by treatment"))+
+    theme_pubr())
+dev.off()
+
+#source data
+
+
+PLOT_BTK_bytreatment_proteoform_melting <- plot_proteoform(ioi = "BTK",
+                          e_set = proteoforms ,
+                          x_col = "temperature",
+                          facet_col = "membership",
+                          colors = c("IBRUTINIB" = "red", "DMSO" = "#04ABEC"),
+                          add_splines = TRUE,
+                          color_col = "Treatment") +
+            xlab("Temperature") +
+            ylab("Fraction non-denatured")+
+            ggtitle(paste0("BTK", " proteoform melting by treatment"))+
+            theme_pubr()
+
+openxlsx::write.xlsx(PLOT_BTK_bytreatment_proteoform_melting$data, "output/sourcedata_BTK_bytreatment_proteoform_melting.xlsx")
+
+
+uniprot_ids <- read.csv("shiny_stable6/uniprot_ids_meltome.txt")
+
+interpro_plot_BTK <- interpro_plot(ioi = "BTK", interpro_file = "path/interpro_description_all_meltome.txt", uniprot_ids = uniprot_ids,
+              membership_colors = membership_colors, peptide_seq_list_file = "shiny_stable6/peptide_seq_list.RDS")
+
+
+interpro_plot(ioi = "BTK", interpro_file = "path/interpro_description_all_meltome.txt", uniprot_ids = uniprot_ids,
+              membership_colors = membership_colors, peptide_seq_list_file = "shiny_stable6/peptide_seq_list.RDS")
+
+
+pdf(file = "output/BTK_interpro_mapping.pdf", width = 15, height = 5)
+
+plot(interpro_plot_BTK)
+
+dev.off()
+
+#####Get source data
+ioi = "BTK"
+interpro_file = "path/interpro_description_all_meltome.txt"
+uniprot_ids = uniprot_ids
+membership_colors = membership_colors
+peptide_seq_list_file = "path/peptide_seq_list.RDS"
+
+
+interpro_ioi <- read.csv(interpro_file)
+interpro_ioi <- interpro_ioi[interpro_ioi$hgnc_symbol == ioi & !is.null(interpro_ioi$interpro_description) & !is.na(interpro_ioi$interpro_description),]
+
+ioi_alphafold <- tryCatch({get_alphafold_file(ioi, uniprot_ids)},
+                          error = function(e){0})
+
+
+  #read a FASTA from uniprot
+  #refer to alpha fold so FASTA is consistent
+  fasta_list <- get_FASTA_fromalphafold(ioi_alphafold)
+  
+
+
+peptide_seq_list <- readRDS(peptide_seq_list_file)
+peptide_seq_list <- peptide_seq_list[[ioi]]
+peptide_indices <- tryCatch({get_peptide_numeric(fasta_list, peptide_seq_list)},
+                            error = function(e){0})
+#retrieve from alphafold so it's consistent with the other visualizations in 3D
+
+interpro_options <- unique(interpro_ioi$interpro_description)
+
+meta_hmap <- matrix(nrow = nchar(fasta_list[[1]]), ncol = length(c("Amino acid residue", "Membership", interpro_options)))
+colnames(meta_hmap) <- c("Amino acid residue", "Membership", interpro_options)
+meta_hmap[,'Amino acid residue'] <- as.numeric(1:nchar(fasta_list[[1]]))
+
+#populate the heatmap
+for(i in as.numeric(meta_hmap[,'Amino acid residue'])){
+  
+  for(j in 1:nrow(interpro_ioi)){
+    
+    if(i >= interpro_ioi$interpro_start[j] & i <= interpro_ioi$interpro_end[j]){
+      
+      meta_hmap[meta_hmap[,'Amino acid residue'] == i,interpro_ioi$interpro_description[j]] <- interpro_ioi$interpro_description[j]
+      
+    }
+    
+  }
+  
+  for(k in 1:length(peptide_indices)){
+    
+    if(as.numeric(peptide_indices[[k]][["start_position"]]) <= i & 
+       as.numeric(nchar(peptide_indices[[k]][["peptide"]]) + peptide_indices[[k]][["start_position"]]) >= i){
+      
+      if(!is.na(meta_hmap[,"Membership"][i]) & meta_hmap[,"Membership"][i] != peptide_indices[[k]][[3]]){
+        meta_hmap[,"Membership"][i] <- paste0("Multiple")
+      }else(
+        meta_hmap[,"Membership"][i] <- peptide_indices[[k]][[3]]
+      ) #end ifelse for membership discovery
+      
+      
+      
+    }
+    
+  }
+  
+}
+
+
+#make sure it's numeric 
+meta_hmap <- as.data.frame(meta_hmap)
+meta_hmap[,'Amino acid residue'] <- as.numeric(meta_hmap[,'Amino acid residue'])
+#make color for multi mapping 
+membership_colors["Multiple"] <- "#494e57"
+
+#make it horizontal
+#meta_hmap <- as.data.frame(t(meta_hmap))
+
+#set legend things to hide
+legend_logical <- logical(length = length(colnames(meta_hmap)))
+legend_logical[1] <- TRUE
+legend_logical[2] <- TRUE
+for (i in 3:length(colnames(meta_hmap))){
+  
+  legend_logical[i] <- FALSE
+  
+}
+
+openxlsx::write.xlsx(meta_hmap, file = "output/source_data_BTK_interpro.xlsx")
+###################################3
+#Alphafold 3D plot
+
+alphafold_plot(ioi = "BTK", uniprot_ids = uniprot_ids, peptide_seq_list_file, fasta_file = NULL, membership_colors = membership_colors
+)
+
+#output fasta for adding to source data
+fasta_BTK <- get_FASTA_fromalphafold(get_alphafold_file("BTK", uniprot_ids))
+sequence_df <- data.frame(Sequence = strsplit(fasta_BTK[["sp|Q06187|BTK_HUMAN"]], "")[[1]])
+openxlsx::write.xlsx(sequence_df, file = "output/source_data_BTK_fasta_sequence.xlsx")
+
+###################################3
+#Main melting plot
+proteoforms$sample_split <- ""
+#proteoforms$treatment <- ""
+proteoforms$sample_separate <- ""
+
+pdf(file = "output/BTK_proteoform_melting.pdf", width = 5.5, height = 3.5)
+ggarrange(plot_proteoform(ioi = "BTK",
+                          e_set = proteoforms[,proteoforms$cell_line == "RCH-ACV"],
+                          x_col = "temperature",
+                          hide_lines = TRUE,
+                          facet_col = "treatment",
+                          colors = membership_colors,
+                          add_splines = TRUE,
+                          line_col = 'Treatment') + xlab("Temperature")+
+            ylab("Fraction non-denatured")+
+            ggtitle("") +
+            theme_pubclean())
+dev.off()
+
+
+######
+#Make alphafold
+uniprot_ids <- read.csv(file = "~/path/uniprot_ids_all_meltome.txt")
+
+alphafold_plot_special("BTK", 
+                       special = NULL ,
+                       uniprot_ids = uniprot_ids, peptide_seq_list_file = c("~/path/peptide_seq_list.RDS"), fasta_file =  NULL,membership_colors = c("1" = "#FF5376",
+                                                                                                                                                                                               "2" = "#72AFD9",
+                                                                                                                                                                                               "3" = "#E3D26F",
+                                                                                                                                                                                               "4" = "#A288E3",
+                                                                                                                                                                                               "5" = "#1B5299",
+                                                                                                                                                                                               "6" = "#68D8D6",
+                                                                                                                                                                                               "NA" = "#494e57"
+                       ))
+
+
+
+
+
