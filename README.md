@@ -22,3 +22,23 @@ Process proteoforms, run NPARC, run CLL aggregation, run annotate_hits
 *analysis.R
 
 Result paths are not set by default and should be be user defined
+
+Dependencies and packages:
+System:
+R version 4.2.3 (2023-03-15)
+
+attached base packages:
+[1] grid      stats     graphics  grDevices utils     datasets  methods   base     
+
+other attached packages:
+ [1] reticulate_1.34.0     circlize_0.4.16       readxl_1.4.3          ggpubr_0.6.0         
+ [5] curl_5.2.0            ComplexHeatmap_2.12.1 NGLVieweR_1.3.1       Rcpi_1.33.2          
+ [9] leiden_0.4.3.1        RColorBrewer_1.1-3    ggthemes_5.1.0        ggpmisc_0.5.5        
+[13] ggpp_0.5.6            ggrepel_0.9.4         cowplot_1.1.3         biobroom_1.28.0      
+[17] broom_1.0.5           BiocParallel_1.30.4   igraph_1.5.1          Hmisc_5.1-1          
+[21] matrixStats_1.2.0     Biobase_2.58.0        BiocGenerics_0.44.0   lubridate_1.9.3      
+[25] forcats_1.0.0         stringr_1.5.1         dplyr_1.1.4           purrr_1.0.2          
+[29] readr_2.1.4           tidyr_1.3.0           tibble_3.2.1          ggplot2_3.5.0        
+[33] tidyverse_2.0.0       data.table_1.14.10   
+
+
