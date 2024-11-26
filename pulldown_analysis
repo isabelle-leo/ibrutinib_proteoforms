@@ -475,8 +475,64 @@ dev.off()
                                                     df_long_merge$p_val.x < 0.05,]$id)
  )
  saveRDS(targets_listed, "output/venn_plot_targets_pulldown.RDS")
- targets_listed[["RCH-ACV TPP hits"]][targets_listed[["RCH-ACV TPP hits"]] %in% targets_listed[["RCH-ACV pulldown hits"]]] #What is in both at proteoform level?
- pdf(file = "output/venn_plot_targets_pulldown.pdf", width = 5, height = 5.2)
+
+ #investigate where they are in one DMSO
+ in_DMSO <- unique(df_long_merge[!is.na(df_long_merge$Value_Plot.x) & 
+                        !is.na(df_long_merge$Value.y) &
+                        df_long_merge$Value_Plot.x/(df_long_merge$Value_Plot.y+.001) > 1 & #add small number to remove NA or 0
+                        df_long_merge$p_val.x <= 1E-10,]$id)
+ 
+ query_tests <- list()
+
+ for(k in in_DMSO){
+   
+   query_data_per <- df_long_merge[!is.na(df_long_merge$Value_Plot.x) & 
+                                     #!is.na(df_long_merge$Value.y) &
+                                     df_long_merge$Value_Plot.x/(df_long_merge$Value_Plot.y+.001) > 1 & #add small number to remove NA or 0
+                                     df_long_merge$p_val.x <= 1E-10&
+                                     df_long_merge$id == k,]
+   
+   query_tests[[k]] <- data.frame("Dose" = query_data_per$dose, "DMSO Value" = query_data_per$Value.y, "Ibru Value" = query_data_per$Value.x)
+   
+ }
+
+ check_pass <- function(df) {
+   # Identify doses with any DMSO presence
+   doses_with_dmso <- df$Dose[!is.na(df$DMSO.Value)]
+   
+   # Filter out rows where Dose is in the doses_with_dmso
+   df_clean <- df %>% 
+     filter(!Dose %in% doses_with_dmso)
+   
+   # Count non-NA Ibru.Values by dose in the cleaned data
+   ibru_counts <- df_clean %>%
+     group_by(Dose) %>%
+     summarise(count = sum(!is.na(Ibru.Value)), .groups = 'drop')
+   
+   # Check if any remaining dose has at least two valid Ibru.Values
+   any(ibru_counts$count >= 2)
+ }
+ 
+ # Apply to each element of the list
+ results <- lapply(query_tests, check_pass)
+ 
+length( names(results)[results == FALSE])
+
+ 
+targets_listed <- list(#"TPP hits" = unique(proteoformtppdata[proteoformtppdata$pVal < .01,]$ioi),
+  "RCH-ACV TPP hits" = unique(df_long_merge[df_long_merge$pAdj.x < 0.05,]$id)[!is.na(unique(df_long_merge[df_long_merge$pAdj.x < 0.05,]$id))],
+  # "RCH-ACV pulldown hits before" = unique(df_long_merge[!is.na(df_long_merge$Value_Plot.x) & 
+  #                                                  df_long_merge$Value_Plot.x/(df_long_merge$Value_Plot.y+.001) > 1 & #add small number to remove NA or 0
+  #                                                  df_long_merge$p_val.x <= 1E-10,]$id),
+   "RCH-ACV pulldown hits" = unique(df_long_merge[!is.na(df_long_merge$Value_Plot.x) & 
+                                                          df_long_merge$Value_Plot.x/(df_long_merge$Value_Plot.y+.001) > 1 & #add small number to remove NA or 0
+                                                          df_long_merge$p_val.x <= 1E-10 &
+                                                   !(df_long_merge$id %in% names(results)[results == FALSE]),]$id)
+  
+)
+ 
+
+pdf(file = "output/venn_plot_targets_pulldown.pdf", width = 5, height = 5.2)
  
  ggvenn(targets_listed, fill_color = c("blue", "#673F56", auto_scale = TRUE)#, auto_scale = TRUE
  )
@@ -517,12 +573,7 @@ dev.off()
  #intensity 
  mean(df_long_merge[df_long_merge$id == "WASHC2C_1" & df_long_merge$dose.x == "20uM",]$Value_Plot.x, na.rm = TRUE)
  mean(df_long_merge[df_long_merge$id == "BTK_2" & df_long_merge$dose.x == "20uM",]$Value_Plot.x, na.rm = TRUE)
- 
-#COG3 - no peptides
-#GSK3B - only proteoform 1 peptides
-#BRAF - only proteoform 1
-#BTK - 1 and 2
-#YES1 - only 1
+
 
 
 
