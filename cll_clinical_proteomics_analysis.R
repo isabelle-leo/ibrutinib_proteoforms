@@ -3,6 +3,8 @@ library(tidyr)
 library(dplyr)
 library(vsn)
 library(parallel)
+library(ggplot2)
+library(ggpubr)
 #library(MultiAssayExperiment)
 '%!in%' <- function(x,y)!('%in%' (x,y))
 expand_rows_with_multiple_terms <- function(df, column_name) {
@@ -455,6 +457,30 @@ ibrutinib_coculture_Herbst$value <- as.numeric(gsub(",", ".", ibrutinib_cocultur
 treatment = data.frame("Condition" = cll_meta$treated,"ColumnName" = cll_meta$TMT,
                        "CLL" = cll_meta$patient_ID.x)
 
+
+#Plot ibrutinib response
+p <- ggplot(ibrutinib_coculture_Herbst, aes(x = PG5, y = value)) +
+  geom_boxplot(aes(fill = PG5)) +  
+  geom_jitter(width = 0.2, size = 2) +  # Add jittered dots
+  #stat_compare_means(method = "wilcox.test", label = "p.format") + 
+  labs(
+    x = "PG5 Group",
+    y = "Viable cell ratio to DMSO"
+  ) +
+  theme_minimal() +
+  scale_fill_brewer(palette = 14)+
+  theme(legend.position = "none")
+p <- p + stat_compare_means(
+  method = "wilcox.test", 
+  label = "p.format",  
+  comparisons = list(c("other", "ASB-CLL")),  # Specify the groups to compare
+  tip.length = 0.01  # Shorten the bar tips
+)
+
+pdf(file = "boxplot_drug_signif.pdf", width = 6, height = 7)
+p
+dev.off()
+                           
 
 generate_treatment_correlations <- function(all_from_CLL,type= "correlation", treatment, id, treated_factors_standard = TRUE, ibrutinib_coculture_Herbst) {
   
